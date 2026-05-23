@@ -25,7 +25,9 @@ public class BuildProcess {
     private BlockPos lastTarget = null;
     private int stateTimer = 0;
     private static final int INTERACT_DELAY = 8;
-    private static final int STUCK_THRESHOLD = 60;
+    private static final int STUCK_THRESHOLD = 80;
+    private int stuckJumpCounter = 0;
+    private BlockPos previousPos = null;
     private enum State { MOVING, PLACING, ADJUSTING, GATHERING }
 
     public static class SchematicBlock {
@@ -55,13 +57,53 @@ public class BuildProcess {
         ClientPlayerEntity player = client.player;
         Vec3d targetVec = Vec3d.ofCenter(target.pos);
         double distance = player.getPos().distanceTo(targetVec);
-        if (lastTarget != null && lastTarget.equals(target.pos)) stuckTicks++;
-        else stuckTicks = 0;
-        lastTarget = target.pos;
-        if (stuckTicks > STUCK_THRESHOLD) { player.jump(); stuckTicks = 0; }
-        if (distance < 2.5) { currentState = State.PLACING; stateTimer = 0; return true; }
-        if (BaritoneIntegration.isAvailable()) BaritoneIntegration.moveTo(target.pos);
-        else simpleMoveTo(client, target.pos);
+
+        // Проверка застревания
+        BlockPos currentPos = player.getBlockPos();
+        if (previousPos != null && previousPos.equals(currentPos)) {
+            stuckTicks++;
+        } else {
+            stuckTicks = 0;
+            stuckJumpCounter = 0;
+        }
+        previousPos = currentPos;
+
+        // Пытаемся выйти из застревания
+        if (stuckTicks > STUCK_THRESHOLD) {
+            player.jump();
+            stuckTicks = 0;
+            stuckJumpCounter++;
+            // Двигаемся в сторону
+            if (stuckJumpCounter > 3) {
+                player.setSprinting(true);
+                client.options.leftKey.setPressed(true);
+                if (stuckJumpCounter > 6) {
+                    client.options.leftKey.setPressed(false);
+                    client.options.rightKey.setPressed(true);
+                }
+                if (stuckJumpCounter > 10) {
+                    client.options.rightKey.setPressed(false);
+                    stuckJumpCounter = 0;
+                }
+            }
+        }
+
+        if (distance < 2.5) {
+            client.options.forwardKey.setPressed(false);
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
+            player.setSprinting(false);
+            currentState = State.PLACING;
+            stateTimer = 0;
+            return true;
+        }
+
+        if (BaritoneIntegration.isAvailable()) {
+            BaritoneIntegration.moveTo(target.pos);
+        } else {
+            simpleMoveTo(client, target.pos);
+        }
+
         return true;
     }
 
@@ -70,11 +112,23 @@ public class BuildProcess {
         Vec3d targetVec = Vec3d.ofCenter(target);
         Vec3d dir = targetVec.subtract(player.getPos()).normalize();
         client.options.forwardKey.setPressed(true);
-        float yaw = (float) Math.toDegrees(Math.atan2(-dir.x, dir.z));
-        float pitch = (float) Math.toDegrees(-Math.asin(Math.min(1, Math.max(-1, dir.y))));
-        player.setYaw(yaw);
-        player.setPitch(pitch);
-        if (dir.y > 0.3 && player.isOnGround()) player.jump();
+
+        // Плавный поворот
+        float targetYaw = (float) Math.toDegrees(Math.atan2(-dir.x, dir.z));
+        float targetPitch = (float) Math.toDegrees(-Math.asin(Math.min(1, Math.max(-1, dir.y))));
+        float currentYaw = player.getYaw();
+        float yawDiff = ((targetYaw - currentYaw) % 360 + 540) % 360 - 180;
+        player.setYaw(currentYaw + yawDiff * 0.3f);
+        player.setPitch(targetPitch);
+
+        if (dir.y > 0.5 && player.isOnGround()) {
+            player.jump();
+        }
+
+        // Бежим если далеко
+        if (player.getPos().distanceTo(targetVec) > 5) {
+            player.setSprinting(true);
+        }
     }
 
     private boolean handlePlacing(MinecraftClient client, SchematicBlock target) {
@@ -82,54 +136,97 @@ public class BuildProcess {
         World world = client.player.getWorld();
         ClientPlayerEntity player = client.player;
         BlockState existing = world.getBlockState(target.pos);
-        if (existing.equals(target.state)) { advanceBlock(client); return true; }
-        if (!existing.isAir() && !existing.equals(target.state)) {
-            if (client.interactionManager != null) client.interactionManager.attackBlock(target.pos, Direction.UP);
+
+        // Блок уже на месте
+        if (existing.equals(target.state)) {
+            advanceBlock(client);
             return true;
         }
+
+        // Если там чужой блок — ломаем
+        if (!existing.isAir() && !existing.equals(target.state)) {
+            if (client.interactionManager != null) {
+                client.interactionManager.attackBlock(target.pos, Direction.UP);
+            }
+            return true;
+        }
+
+        // Проверяем материал
         Item neededItem = target.state.getBlock().asItem();
-        if (!hasItem(player, neededItem, 1)) { currentState = State.GATHERING; stateTimer = 0; return true; }
+        if (!hasItem(player, neededItem, 1)) {
+            currentState = State.GATHERING;
+            stateTimer = 0;
+            return true;
+        }
+
         selectSlotWithItem(player, neededItem);
         BlockHitResult hit = calculatePlacementHit(target.pos, target.state, player);
-        if (client.interactionManager != null && hit != null)
+
+        if (client.interactionManager != null && hit != null) {
             client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
-        if (needsAdjustment(target.state)) { currentState = State.ADJUSTING; stateTimer = 0; }
-        else advanceBlock(client);
+        }
+
+        // Повторители требуют докликивания
+        if (needsAdjustment(target.state)) {
+            currentState = State.ADJUSTING;
+            stateTimer = 0;
+        } else {
+            advanceBlock(client);
+        }
+
         return true;
     }
 
     private boolean handleAdjusting(MinecraftClient client, SchematicBlock target) {
-        if (stateTimer < INTERACT_DELAY) return true;
+        if (stateTimer < INTERACT_DELAY * 2) return true;
         World world = client.player.getWorld();
         BlockState current = world.getBlockState(target.pos);
-        if (current.equals(target.state)) { advanceBlock(client); return true; }
-        if (current.isAir() || !current.getBlock().equals(target.state.getBlock())) {
-            currentState = State.PLACING; stateTimer = 0; return true;
+
+        if (current.equals(target.state)) {
+            advanceBlock(client);
+            return true;
         }
-        if (client.interactionManager != null)
+
+        if (current.isAir() || !current.getBlock().equals(target.state.getBlock())) {
+            currentState = State.PLACING;
+            stateTimer = 0;
+            return true;
+        }
+
+        // Докликиваем повторитель
+        if (client.interactionManager != null) {
             client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND,
                 new BlockHitResult(Vec3d.ofCenter(target.pos), Direction.UP, target.pos, false));
+        }
         stateTimer = 0;
         return true;
     }
 
     private boolean handleGathering(MinecraftClient client, SchematicBlock target) {
         Item neededItem = target.state.getBlock().asItem();
-        if (hasItem(client.player, neededItem, 1)) { currentState = State.MOVING; stateTimer = 0; return true; }
+        if (hasItem(client.player, neededItem, 1)) {
+            currentState = State.MOVING;
+            stateTimer = 0;
+            return true;
+        }
+
         BlockPos chestPos = findItemInChests(client, neededItem);
         if (chestPos == null) {
             client.player.sendMessage(Text.literal("§c[BuildHelper] Нет блока: " + neededItem.getName().getString()), false);
             return false;
         }
+
         if (client.player.getPos().distanceTo(Vec3d.ofCenter(chestPos)) > 2.5) {
             if (BaritoneIntegration.isAvailable()) BaritoneIntegration.moveTo(chestPos);
             else simpleMoveTo(client, chestPos);
             return true;
         }
+
         openChestAndTakeItems(client, chestPos, neededItem);
         if (hasItem(client.player, neededItem, 1)) {
             client.player.sendMessage(Text.literal("§a[BuildHelper] Взял: " + neededItem.getName().getString()), false);
-            currentState = State.MOVING; stateTimer = 0;
+            currentState = State.MOVING;
+            stateTimer = 0;
         }
         return true;
     }
@@ -139,8 +236,12 @@ public class BuildProcess {
         currentState = State.MOVING;
         stateTimer = 0;
         stuckTicks = 0;
-        lastTarget = null;
+        stuckJumpCounter = 0;
+        previousPos = null;
         client.options.forwardKey.setPressed(false);
+        client.options.leftKey.setPressed(false);
+        client.options.rightKey.setPressed(false);
+        client.player.setSprinting(false);
     }
 
     private boolean hasItem(PlayerEntity player, Item item, int count) {
@@ -163,17 +264,26 @@ public class BuildProcess {
     }
 
     private BlockHitResult calculatePlacementHit(BlockPos pos, BlockState state, PlayerEntity player) {
-        BlockPos against = pos.down();
-        Direction face = Direction.UP;
-        if (state.getBlock() instanceof TorchBlock) {
-            for (Direction dir : Direction.values()) {
-                if (dir == Direction.UP || dir == Direction.DOWN) continue;
-                if (!player.getWorld().getBlockState(pos.offset(dir.getOpposite())).isAir()) {
-                    against = pos.offset(dir.getOpposite()); face = dir; break;
-                }
+        World world = player.getWorld();
+        // Ищем любой соседний блок для опоры
+        for (Direction dir : Direction.values()) {
+            BlockPos neighbor = pos.offset(dir);
+            if (!world.getBlockState(neighbor).isAir()) {
+                return new BlockHitResult(
+                    Vec3d.ofCenter(neighbor),
+                    dir.getOpposite(),
+                    neighbor,
+                    false
+                );
             }
         }
-        return new BlockHitResult(Vec3d.ofCenter(against), face, against, false);
+        // Нет соседей — кликаем снизу
+        return new BlockHitResult(
+            Vec3d.ofCenter(pos.down()),
+            Direction.UP,
+            pos.down(),
+            false
+        );
     }
 
     private boolean needsAdjustment(BlockState state) {
@@ -205,7 +315,12 @@ public class BuildProcess {
 
     public void stop() {
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player != null) client.options.forwardKey.setPressed(false);
+        if (client.player != null) {
+            client.options.forwardKey.setPressed(false);
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
+            client.player.setSprinting(false);
+        }
         BaritoneIntegration.stop();
     }
-                                           }
+                }
