@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "buildhelper",
+  "version": "1.0.0",
+  "name": "Build Helper",
+  "description": "Auto-builds Litematica schematics",
+  "authors": ["BuildHelperTeam"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": ["com.buildhelper.BuildHelperMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.9",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
